@@ -1,0 +1,300 @@
+// @version=6
+// PitchDome LS-OB + Liquidity Sweeps 1:1 Mix
+indicator("PitchDome LS-OB Swing + Liquidity Sweeps", overlay=true, max_boxes_count=500, max_lines_count=500)
+
+// ----------------- Inputs -----------------
+pivotLen = input.int(10, "Pivot Length", minval=1)
+
+// OB styling
+bullExtend = input.int(3, "Bullish OB Extend")
+bullBgColor = input.color(color.new(#169400, 80))
+bullBorderColor = input.color(#169400)
+bullLineColor = input.color(color.new(#9598a1, 37))
+
+bearExtend = input.int(3, "Bearish OB Extend")
+bearBgColor = input.color(color.new(#ff1100, 80))
+bearBorderColor = input.color(#ff1100)
+bearLineColor = input.color(color.new(#9598a1, 37))
+
+lineStyle = input.string("⎯⎯⎯", "OB Midline Style", options=["⎯⎯⎯", "----", "····"])
+lineWidth = input.int(1, "OB Midline Width")
+mitigationMode = input.string("Wick", "Mitigation Method", options=["Wick", "Close"])
+
+// Liquidity Sweep settings
+len = input.int(5, "Swings")
+colBl  = input.color(#089981, "Bullish Liquidity")
+colBr  = input.color(#f23645, "Bearish Liquidity")
+colBl2 = input.color(color.new(#089981, 80), "Bullish Liquidity Fill")
+colBr2 = input.color(color.new(#f23645, 80), "Bearish Liquidity Fill")
+colBl3 = input.color(color.new(#089981, 41), "Bullish Area")
+colBr3 = input.color(color.new(#f23645, 41), "Bearish Area")
+
+// Liquidity line styling
+liqLineWidth = input.int(2, "Liquidity Line Width")
+liqLineStyle = input.string("Solid", "Liquidity Line Style", options=["Solid", "Dashed", "Dotted"])
+liqExtend = input.string("Right", "Liquidity Line Extend", options=["None", "Right", "Both"])
+showLiqLines = input.bool(true, "Show Liquidity Lines")
+showLiqAreas = input.bool(false, "Show Liquidity Areas")
+removeSweptLiq = input.bool(true, "Remove Swept Liquidity", group="Liquidity Filtering")
+maxLiqLines = input.int(20, "Max Liquidity Lines", minval=5, maxval=100, group="Liquidity Filtering")
+minSwingSize = input.float(0.0, "Min Swing Size %", minval=0.0, step=0.1, tooltip="Only show liquidity if swing size is above this %", group="Liquidity Filtering")
+
+// ----------------- Utility Functions -----------------
+getLineStyle(style) => 
+    switch style
+        "⎯⎯⎯" => line.style_solid
+        "----" => line.style_dashed
+        "····" => line.style_dotted
+        => line.style_solid
+
+getLiqLineStyle(style) =>
+    switch style
+        "Solid" => line.style_solid
+        "Dashed" => line.style_dashed
+        "Dotted" => line.style_dotted
+        => line.style_solid
+
+getExtendMode(mode) =>
+    switch mode
+        "None" => extend.none
+        "Right" => extend.right
+        "Both" => extend.both
+        => extend.right
+
+getCoordinates(condition, top, bottom, value) =>
+    var obTop = array.new_float()
+    var obBottom = array.new_float()
+    var obMid = array.new_float()
+    var obLeft = array.new_int()
+    float obValue = na
+    
+    if condition
+        avg = math.avg(top, bottom)
+        array.unshift(obTop, top)
+        array.unshift(obBottom, bottom)
+        array.unshift(obMid, avg)
+        array.unshift(obLeft, time[pivotLen])
+        obValue := value
+    
+    [obTop, obBottom, obMid, obLeft, obValue]
+
+removeMitigated(obTop, obBottom, obLeft, obMid, target, isBull) =>
+    targetArr = isBull ? obBottom : obTop
+    i = 0
+    while i < array.size(targetArr)
+        element = array.get(targetArr, i)
+        if (isBull ? target < element : target > element)
+            array.remove(obTop, i)
+            array.remove(obBottom, i)
+            array.remove(obMid, i)
+            array.remove(obLeft, i)
+        else
+            i += 1
+
+// Remove swept liquidity lines
+removeSweptLiquidity(liqLines, liqLevels, liqTimes, currentHigh, currentLow, isHigh) =>
+    i = 0
+    while i < array.size(liqLevels)
+        level = array.get(liqLevels, i)
+        // Check if price has swept through the liquidity level
+        // For high liquidity: price breaks above (sweeps the high)
+        // For low liquidity: price breaks below (sweeps the low)
+        swept = isHigh ? (currentHigh > level) : (currentLow < level)
+        if swept
+            // Delete the line if it exists
+            if i < array.size(liqLines)
+                oldLine = array.get(liqLines, i)
+                if not na(oldLine)
+                    line.delete(oldLine)
+            // Remove from all arrays (keep arrays in sync)
+            if i < array.size(liqLines)
+                array.remove(liqLines, i)
+            if i < array.size(liqLevels)
+                array.remove(liqLevels, i)
+            if i < array.size(liqTimes)
+                array.remove(liqTimes, i)
+        else
+            i += 1
+
+// Draw OB boxes
+drawOrderBlocks(obTop, obBottom, obLeft, obMid, extendCount, bgColor, borderColor, lineColor) =>
+    var boxArray = array.new_box()
+    var lineArray = array.new_line()
+    
+    if barstate.isfirst
+        for i = 0 to extendCount - 1
+            array.unshift(boxArray, box.new(na, na, na, na, xloc=xloc.bar_time, extend=extend.right, bgcolor=bgColor, border_color=color.new(borderColor, 70)))
+            array.unshift(lineArray, line.new(na, na, na, na, xloc=xloc.bar_time, extend=extend.right, color=lineColor, style=getLineStyle(lineStyle), width=lineWidth))
+    
+    if barstate.islast and array.size(obTop) > 0
+        for i = 0 to math.min(extendCount - 1, array.size(obTop) - 1)
+            bx = array.get(boxArray, i)
+            ln = array.get(lineArray, i)
+            box.set_lefttop(bx, array.get(obLeft, i), array.get(obTop, i))
+            box.set_rightbottom(bx, array.get(obLeft, i), array.get(obBottom, i))
+            line.set_xy1(ln, array.get(obLeft, i), array.get(obMid, i))
+            line.set_xy2(ln, array.get(obLeft, i) + 1, array.get(obMid, i))
+
+// ----------------- Core OB Logic -----------------
+var marketState = 0
+upper = ta.highest(pivotLen)
+lower = ta.lowest(pivotLen)
+marketState := high[pivotLen] > upper ? 0 : low[pivotLen] < lower ? 1 : marketState[1]
+
+pivotHighVol = ta.pivothigh(volume, pivotLen, pivotLen)
+
+[bullTop, bullBottom, bullMid, bullLeft, bullSignal] = getCoordinates(not na(pivotHighVol) and marketState == 1, hl2[pivotLen], low[pivotLen], low[pivotLen])
+[bearTop, bearBottom, bearMid, bearLeft, bearSignal] = getCoordinates(not na(pivotHighVol) and marketState == 0, high[pivotLen], hl2[pivotLen], high[pivotLen])
+
+removeMitigated(bullTop, bullBottom, bullLeft, bullMid, low, true)
+removeMitigated(bearTop, bearBottom, bearLeft, bearMid, high, false)
+
+drawOrderBlocks(bullTop, bullBottom, bullLeft, bullMid, bullExtend, bullBgColor, bullBorderColor, bullLineColor)
+drawOrderBlocks(bearTop, bearBottom, bearLeft, bearMid, bearExtend, bearBgColor, bearBorderColor, bearLineColor)
+
+// ----------------- Liquidity Sweeps (Fixed) -----------------
+ph = ta.pivothigh(len, len)
+pl = ta.pivotlow(len, len)
+
+var line[] liqLinesH = array.new_line()
+var line[] liqLinesL = array.new_line()
+var float[] liqLevelsH = array.new_float()
+var float[] liqLevelsL = array.new_float()
+var int[] liqTimesH = array.new_int()
+var int[] liqTimesL = array.new_int()
+
+// Store pivot high liquidity levels
+if not na(ph)
+    pivotHigh = high[len]
+    pivotTime = time[len]
+    
+    // Check minimum swing size filter
+    swingSize = (pivotHigh - low[len]) / low[len] * 100
+    shouldAdd = minSwingSize == 0.0 or swingSize >= minSwingSize
+    
+    if shouldAdd
+        array.unshift(liqLevelsH, pivotHigh)
+        array.unshift(liqTimesH, pivotTime)
+        
+        if showLiqLines
+            // Create line extending to the right
+            ln = line.new(
+                 x1=pivotTime, 
+                 y1=pivotHigh, 
+                 x2=bar_index, 
+                 y2=pivotHigh, 
+                 xloc=xloc.bar_time, 
+                 extend=getExtendMode(liqExtend), 
+                 color=colBr, 
+                 width=liqLineWidth,
+                 style=getLiqLineStyle(liqLineStyle))
+            array.unshift(liqLinesH, ln)
+    
+    // Keep only max lines (remove oldest)
+    while array.size(liqLinesH) > maxLiqLines
+        oldLine = array.pop(liqLinesH)
+        line.delete(oldLine)
+    while array.size(liqLevelsH) > maxLiqLines
+        array.pop(liqLevelsH)
+    while array.size(liqTimesH) > maxLiqLines
+        array.pop(liqTimesH)
+
+// Store pivot low liquidity levels
+if not na(pl)
+    pivotLow = low[len]
+    pivotTime = time[len]
+    
+    // Check minimum swing size filter
+    swingSize = (high[len] - pivotLow) / pivotLow * 100
+    shouldAdd = minSwingSize == 0.0 or swingSize >= minSwingSize
+    
+    if shouldAdd
+        array.unshift(liqLevelsL, pivotLow)
+        array.unshift(liqTimesL, pivotTime)
+        
+        if showLiqLines
+            // Create line extending to the right
+            ln = line.new(
+                 x1=pivotTime, 
+                 y1=pivotLow, 
+                 x2=bar_index, 
+                 y2=pivotLow, 
+                 xloc=xloc.bar_time, 
+                 extend=getExtendMode(liqExtend), 
+                 color=colBl, 
+                 width=liqLineWidth,
+                 style=getLiqLineStyle(liqLineStyle))
+            array.unshift(liqLinesL, ln)
+    
+    // Keep only max lines (remove oldest)
+    while array.size(liqLinesL) > maxLiqLines
+        oldLine = array.pop(liqLinesL)
+        line.delete(oldLine)
+    while array.size(liqLevelsL) > maxLiqLines
+        array.pop(liqLevelsL)
+    while array.size(liqTimesL) > maxLiqLines
+        array.pop(liqTimesL)
+
+// Remove swept liquidity lines
+if removeSweptLiq
+    removeSweptLiquidity(liqLinesH, liqLevelsH, liqTimesH, high, low, true)
+    removeSweptLiquidity(liqLinesL, liqLevelsL, liqTimesL, high, low, false)
+
+// Update existing lines to extend to current bar
+if barstate.islast and showLiqLines
+    // Update high liquidity lines
+    for i = 0 to array.size(liqLinesH) - 1
+        if i < array.size(liqLevelsH) and i < array.size(liqTimesH)
+            ln = array.get(liqLinesH, i)
+            level = array.get(liqLevelsH, i)
+            startTime = array.get(liqTimesH, i)
+            line.set_xy1(ln, startTime, level)
+            line.set_xy2(ln, time, level)
+    
+    // Update low liquidity lines
+    for i = 0 to array.size(liqLinesL) - 1
+        if i < array.size(liqLevelsL) and i < array.size(liqTimesL)
+            ln = array.get(liqLinesL, i)
+            level = array.get(liqLevelsL, i)
+            startTime = array.get(liqTimesL, i)
+            line.set_xy1(ln, startTime, level)
+            line.set_xy2(ln, time, level)
+
+// Draw liquidity areas if enabled
+if showLiqAreas
+    // Draw areas around pivot highs
+    for i = 0 to array.size(liqLevelsH) - 1
+        if i < array.size(liqTimesH)
+            level = array.get(liqLevelsH, i)
+            startTime = array.get(liqTimesH, i)
+            box.new(
+                 left=startTime, 
+                 top=level * 1.0001, 
+                 right=time, 
+                 bottom=level * 0.9999, 
+                 xloc=xloc.bar_time, 
+                 extend=extend.right, 
+                 bgcolor=colBr3, 
+                 border_color=na)
+    
+    // Draw areas around pivot lows
+    for i = 0 to array.size(liqLevelsL) - 1
+        if i < array.size(liqTimesL)
+            level = array.get(liqLevelsL, i)
+            startTime = array.get(liqTimesL, i)
+            box.new(
+                 left=startTime, 
+                 top=level * 1.0001, 
+                 right=time, 
+                 bottom=level * 0.9999, 
+                 xloc=xloc.bar_time, 
+                 extend=extend.right, 
+                 bgcolor=colBl3, 
+                 border_color=na)
+
+// ----------------- Alerts -----------------
+alertcondition(not na(bullSignal), "Bullish OB Formed", "Bullish OB detected")
+alertcondition(not na(bearSignal), "Bearish OB Formed", "Bearish OB detected")
+alertcondition(not na(ph), "Liquidity Sweep High", "Pivot high liquidity level detected")
+alertcondition(not na(pl), "Liquidity Sweep Low", "Pivot low liquidity level detected")
+
